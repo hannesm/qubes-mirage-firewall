@@ -10,26 +10,31 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 (* Transmission *)
 
-let transmit_ipv4 packet iface =
+let rec transmit_ipv4 ?(off = 0) packet iface =
   Lwt.catch
     (fun () ->
        Lwt.catch
          (fun () ->
+            let more = ref None in
             iface#writev `IPv4 (fun b ->
-                match Nat_packet.into_cstruct packet b with
+                match Nat_packet.into_cstruct ~off packet b with
                 | Error e ->
                   Log.warn (fun f -> f "Failed to write packet to %a: %a"
                                Ipaddr.V4.pp iface#other_ip
                                Nat_packet.pp_error e);
                   0
-                | Ok n -> n
-              )
+                | Ok (n, off) ->
+                  Log.warn (fun f -> f "offset is %a, wrote %d bytes"
+                                Fmt.(option ~none:(unit "no") int) off n);
+                  more := off ; n
+              ) >|= fun () ->
+            !more
          )
          (fun ex ->
             Log.warn (fun f -> f "Failed to write packet to %a: %s"
                          Ipaddr.V4.pp iface#other_ip
                          (Printexc.to_string ex));
-            Lwt.return ()
+            Lwt.return None
          )
     )
     (fun ex ->
@@ -37,8 +42,10 @@ let transmit_ipv4 packet iface =
                    (Printexc.to_string ex)
                    Nat_packet.pp packet
                );
-       Lwt.return ()
-    )
+       Lwt.return None
+    ) >>= function
+  | None -> Lwt.return_unit
+  | Some off -> transmit_ipv4 ~off packet iface
 
 let forward_ipv4 t packet =
   let `IPv4 (ip, _) = packet in

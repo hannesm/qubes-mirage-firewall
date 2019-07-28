@@ -32,23 +32,34 @@ module Make(Clock : Mirage_clock_lwt.MCLOCK) = struct
   end
 
   let listen t router =
+    let frags = ref (Fragments.Cache.empty (256 * 1024)) in
     Netif.listen t.net ~header_size:Ethernet_wire.sizeof_ethernet (fun frame ->
         (* Handle one Ethernet frame from NetVM *)
         Eth.input t.eth
           ~arpv4:(Arp.input t.arp)
           ~ipv4:(fun ip ->
-              match Nat_packet.of_ipv4_packet ip with
-              | exception ex ->
-                Log.err (fun f -> f "Error unmarshalling ethernet frame from uplink: %s@.%a" (Printexc.to_string ex)
-                            Cstruct.hexdump_pp frame
-                        );
-                Lwt.return_unit
-              | Error e ->
-                Log.warn (fun f -> f "Ignored unknown IPv4 message from uplink: %a" Nat_packet.pp_error e);
+              match Ipv4_packet.Unmarshal.of_cstruct ip with
+              | Error msg ->
+                Log.warn (fun m -> m "Ignoring IPv4 packet (decode error) %s" msg);
                 Lwt.return ()
-              | Ok packet ->
-                Firewall.ipv4_from_netvm router packet
-            )
+              | Ok (hdr, payload) ->
+                let frags', pkt = Fragments.process !frags (Clock.elapsed_ns ()) hdr payload in
+                frags := frags';
+                match pkt with
+                 | None -> Lwt.return ()
+                 | Some (hdr, pay) ->
+                   let cs = Ipv4_packet.Marshal.make_cstruct ~payload_len:(Cstruct.len pay) hdr in
+                   match Nat_packet.of_ipv4_packet (Cstruct.append cs pay) with
+                   | exception ex ->
+                     Log.err (fun f -> f "Error unmarshalling ethernet frame from uplink: %s@.%a" (Printexc.to_string ex)
+                                 Cstruct.hexdump_pp frame
+                             );
+                     Lwt.return_unit
+                   | Error e ->
+                     Log.warn (fun f -> f "Ignored unknown IPv4 message from uplink: %a" Nat_packet.pp_error e);
+                     Lwt.return ()
+                   | Ok packet ->
+                     Firewall.ipv4_from_netvm router packet)
           ~ipv6:(fun _ip -> return ())
           frame
       ) >|= or_raise "Uplink listen loop" Netif.pp_error

@@ -56,23 +56,34 @@ let input_arp ~fixed_arp ~iface request =
       iface#writev `ARP (fun b -> Arp_packet.encode_into response b; Arp_packet.size)
 
 (** Handle an IPv4 packet from the client. *)
-let input_ipv4 ~iface ~router packet =
-  match Nat_packet.of_ipv4_packet packet with
-  | Error e ->
-    Log.warn (fun f -> f "Ignored unknown IPv4 message: %a" Nat_packet.pp_error e);
-    Lwt.return ()
-  | Ok packet ->
-    let `IPv4 (ip, _) = packet in
-    let src = ip.Ipv4_packet.src in
-    if src = iface#other_ip then Firewall.ipv4_from_client router ~src:iface packet
-    else (
-      Log.warn (fun f -> f "Incorrect source IP %a in IP packet from %a (dropping)"
-                   Ipaddr.V4.pp src Ipaddr.V4.pp iface#other_ip);
-      return ()
-    )
+let input_ipv4 clock frags ~iface ~router packet =
+  match Ipv4_packet.Unmarshal.of_cstruct packet with
+  | Error msg ->
+    Log.warn (fun m -> m "Ignoring IPv4 packet (decode error) %s" msg);
+    Lwt.return frags
+  | Ok (hdr, payload) ->
+    let frags', pkt = Fragments.process frags (clock ()) hdr payload in
+    (match pkt with
+     | None -> Lwt.return ()
+     | Some (hdr, pay) ->
+       let cs = Ipv4_packet.Marshal.make_cstruct ~payload_len:(Cstruct.len pay) hdr in
+       match Nat_packet.of_ipv4_packet (Cstruct.append cs pay) with
+       | Error e ->
+         Log.warn (fun f -> f "Ignored unknown IPv4 message: %a" Nat_packet.pp_error e);
+         Lwt.return ()
+       | Ok packet ->
+         let `IPv4 (ip, _) = packet in
+         let src = ip.Ipv4_packet.src in
+         if src = iface#other_ip then Firewall.ipv4_from_client router ~src:iface packet
+         else (
+           Log.warn (fun f -> f "Incorrect source IP %a in IP packet from %a (dropping)"
+                        Ipaddr.V4.pp src Ipaddr.V4.pp iface#other_ip);
+           return ()
+         )) >|= fun () ->
+    frags'
 
 (** Connect to a new client's interface and listen for incoming frames. *)
-let add_vif { Dao.ClientVif.domid; device_id } ~client_ip ~router ~cleanup_tasks =
+let add_vif clock { Dao.ClientVif.domid; device_id } ~client_ip ~router ~cleanup_tasks =
   Netback.make ~domid ~device_id >>= fun backend ->
   Log.info (fun f -> f "Client %d (IP: %s) ready" domid (Ipaddr.V4.to_string client_ip));
   ClientEth.connect backend >>= fun eth ->
@@ -83,6 +94,7 @@ let add_vif { Dao.ClientVif.domid; device_id } ~client_ip ~router ~cleanup_tasks
   Router.add_client router iface >>= fun () ->
   Cleanup.on_cleanup cleanup_tasks (fun () -> Router.remove_client router iface);
   let fixed_arp = Client_eth.ARP.create ~net:client_eth iface in
+  let frags = ref (Fragments.Cache.empty (256 * 1024)) in
   Netback.listen backend ~header_size:Ethernet_wire.sizeof_ethernet (fun frame ->
     match Ethernet_packet.Unmarshal.of_cstruct frame with
     | exception ex ->
@@ -94,18 +106,20 @@ let add_vif { Dao.ClientVif.domid; device_id } ~client_ip ~router ~cleanup_tasks
     | Ok (eth, payload) ->
         match eth.Ethernet_packet.ethertype with
         | `ARP -> input_arp ~fixed_arp ~iface payload
-        | `IPv4 -> input_ipv4 ~iface ~router payload
+        | `IPv4 ->
+          input_ipv4 clock !frags ~iface ~router payload >|= fun frags' ->
+          frags := frags'
         | `IPv6 -> return () (* TODO: oh no! *)
   )
   >|= or_raise "Listen on client interface" Netback.pp_error
 
 (** A new client VM has been found in XenStore. Find its interface and connect to it. *)
-let add_client ~router vif client_ip =
+let add_client clock ~router vif client_ip =
   let cleanup_tasks = Cleanup.create () in
   Log.info (fun f -> f "add client vif %a with IP %a" Dao.ClientVif.pp vif Ipaddr.V4.pp client_ip);
   Lwt.async (fun () ->
       Lwt.catch (fun () ->
-          add_vif vif ~client_ip ~router ~cleanup_tasks
+          add_vif clock vif ~client_ip ~router ~cleanup_tasks
         )
         (fun ex ->
            Log.warn (fun f -> f "Error with client %a: %s"
@@ -116,7 +130,7 @@ let add_client ~router vif client_ip =
   cleanup_tasks
 
 (** Watch XenStore for notifications of new clients. *)
-let listen router =
+let listen clock router =
   Dao.watch_clients (fun new_set ->
     (* Check for removed clients *)
     !clients |> Dao.VifMap.iter (fun key cleanup ->
@@ -129,7 +143,7 @@ let listen router =
     (* Check for added clients *)
     new_set |> Dao.VifMap.iter (fun key ip_addr ->
       if not (Dao.VifMap.mem key !clients) then (
-        let cleanup = add_client ~router key ip_addr in
+        let cleanup = add_client clock ~router key ip_addr in
         clients := !clients |> Dao.VifMap.add key cleanup
       )
     )
